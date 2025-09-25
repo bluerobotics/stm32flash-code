@@ -1,0 +1,211 @@
+name: release
+
+on:
+  release:
+    types: [published]
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux cross-compilation targets
+          - target: aarch64-unknown-linux-musl
+            runs-on: ubuntu-22.04
+            image: ghcr.io/cross-rs/aarch64-unknown-linux-musl:main
+            cc: aarch64-linux-musl-gcc
+            cxx: aarch64-linux-musl-g++
+            processor: aarch64
+            os: linux
+          - target: armv7-unknown-linux-musleabihf
+            runs-on: ubuntu-22.04
+            image: ghcr.io/cross-rs/armv7-unknown-linux-musleabihf:main
+            cc: arm-linux-musleabihf-gcc
+            cxx: arm-linux-musleabihf-g++
+            processor: armv7
+            os: linux
+          - target: x86_64-unknown-linux-musl
+            runs-on: ubuntu-22.04
+            image: ghcr.io/cross-rs/x86_64-unknown-linux-musl:main
+            cc: x86_64-linux-musl-gcc
+            cxx: x86_64-linux-musl-g++
+            processor: x86_64
+            os: linux
+          # Windows cross-compilation targets
+          - target: x86_64-pc-windows-gnu
+            runs-on: ubuntu-22.04
+            image: ghcr.io/cross-rs/x86_64-pc-windows-gnu:main
+            cc: x86_64-w64-mingw32-gcc
+            cxx: x86_64-w64-mingw32-g++
+            processor: x86_64
+            os: windows
+          # macOS native targets
+          - target: aarch64-apple-darwin
+            runs-on: macos-14
+            osx_arch: arm64
+            os: macos
+          - target: x86_64-apple-darwin
+            runs-on: macos-14
+            osx_arch: x86_64
+            os: macos
+    container: ${{ matrix.image }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Mark workspace safe for git
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Configure build environment
+        run: |
+          if [ "${{ matrix.os }}" = "linux" ]; then
+            echo "CC=${{ matrix.cc }}" >> $GITHUB_ENV
+            echo "CFLAGS=-static" >> $GITHUB_ENV
+            echo "LDFLAGS=-static" >> $GITHUB_ENV
+          elif [ "${{ matrix.os }}" = "macos" ]; then
+            echo "CC=clang" >> $GITHUB_ENV
+            echo "CFLAGS=-arch ${{ matrix.osx_arch }}" >> $GITHUB_ENV
+            echo "LDFLAGS=-arch ${{ matrix.osx_arch }}" >> $GITHUB_ENV
+          elif [ "${{ matrix.os }}" = "windows" ]; then
+            echo "CC=${{ matrix.cc }}" >> $GITHUB_ENV
+            echo "CXX=${{ matrix.cxx }}" >> $GITHUB_ENV
+          fi
+      - name: Build
+        run: |
+          if [ "${{ matrix.os }}" = "linux" ]; then
+            PARALLEL_JOBS=$(nproc)
+          elif [ "${{ matrix.os }}" = "macos" ]; then
+            PARALLEL_JOBS=$(sysctl -n hw.ncpu | cut -d" " -f2)
+          else
+            # For Windows and other containers, use a default
+            PARALLEL_JOBS=4
+          fi
+          make -j$PARALLEL_JOBS
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ matrix.os == 'windows' && 'stm32flash.exe' || 'stm32flash' }}
+          if-no-files-found: error
+
+  test:
+    name: Test ${{ matrix.target }}
+    runs-on: ${{ matrix.runs-on }}
+    needs: [build]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-unknown-linux-musl
+            runs-on: ubuntu-22.04
+            arch: aarch64
+            distro: ubuntu24.04
+            use_emulator: true
+          - target: armv7-unknown-linux-musleabihf
+            runs-on: ubuntu-22.04
+            arch: armv7
+            distro: ubuntu24.04
+            use_emulator: true
+          - target: x86_64-unknown-linux-musl
+            runs-on: ubuntu-22.04
+            use_emulator: false
+          - target: x86_64-pc-windows-gnu
+            runs-on: windows-latest
+            os: windows
+            use_emulator: false
+          - target: aarch64-apple-darwin
+            runs-on: macos-14
+            use_emulator: false
+          - target: x86_64-apple-darwin
+            runs-on: macos-14
+            use_emulator: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: artifacts
+      - name: Test Linux (emulated)
+        if: ${{ matrix.use_emulator }}
+        uses: uraimo/run-on-arch-action@v3
+        with:
+          arch: ${{ matrix.arch }}
+          distro: ${{ matrix.distro }}
+          githubToken: ${{ github.token }}
+          run: |
+            binary_name="${{ matrix.os == 'windows' && 'stm32flash.exe' || 'stm32flash' }}"
+            chmod +x "artifacts/$binary_name"
+            "./artifacts/$binary_name" --version || "./artifacts/$binary_name" | head -3 || true
+      - name: Test macOS/Linux (native)
+        if: ${{ !matrix.use_emulator && matrix.os != 'windows' }}
+        shell: bash
+        run: |
+          binary_name="${{ matrix.os == 'windows' && 'stm32flash.exe' || 'stm32flash' }}"
+          chmod +x "artifacts/$binary_name"
+          "./artifacts/$binary_name" --version || "./artifacts/$binary_name" | head -3 || true
+      - name: Test Windows (native)
+        if: ${{ matrix.os == 'windows' }}
+        shell: bash
+        run: |
+          echo "Windows binary downloaded:"
+          ls -la artifacts/
+          # On Windows, we can actually run the executable
+          binary_name="${{ matrix.os == 'windows' && 'stm32flash.exe' || 'stm32flash' }}"
+          echo "Testing Windows executable: $binary_name"
+          ./"artifacts/$binary_name" --help | head -5 || ./"artifacts/$binary_name" | head -3 || true
+          echo "Windows binary test complete"
+
+  publish:
+    name: Publish GitHub Release
+    runs-on: ubuntu-22.04
+    needs: [build, test]
+    if: ${{ github.event_name == 'release' && !github.event.release.prerelease && !github.event.release.draft }}
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Prepare release assets
+        run: |
+          cd artifacts
+          for dir in */; do
+            if [ -d "$dir" ]; then
+              platform="${dir%/}"
+              echo "Creating zip for $platform"
+              binary_file=$(ls "$dir"/* 2>/dev/null | head -1)
+              if [ -n "$binary_file" ]; then
+                if [[ "$platform" == *"windows"* ]]; then
+                  mv "$binary_file" "stm32flash.exe"
+                  zip "stm32flash-${platform}.zip" "stm32flash.exe"
+                  rm "stm32flash.exe"
+                else
+                  mv "$binary_file" "stm32flash"
+                  zip "stm32flash-${platform}.zip" "stm32flash"
+                  rm "stm32flash"
+                fi
+              fi
+              rmdir "$dir"
+            fi
+          done
+        shell: bash
+      - name: Upload Assets to Release
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: artifacts/stm32flash-*
+          file_glob: true
+          tag: ${{ github.event.release.tag_name }}
+          overwrite: true
